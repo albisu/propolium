@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Literal, Tuple
+from typing import Any, Dict, List, Literal, Tuple
 
 import numpy as np
 import pandas as pd
@@ -235,4 +235,146 @@ def run_prop_strategy_monte_carlo(
         "max_steps": max_steps,
         "n_sims": n_sims,
     }
+
+
+def run_firm_comparison_batch(
+    *,
+    df: pd.DataFrame,
+    firms: List[Dict[str, Any]],
+    n_sims: int = 10_000,
+    seed: int = 42,
+    max_steps_cap: int = 700,
+) -> pd.DataFrame:
+    """
+    Vectorized multi-firm Monte Carlo: shape (n_firms, n_sims) per step.
+    Each firm dict must include: name, starting_equity, profit_target, max_loss, daily_loss,
+    drawdown_type ('Static'|'Trailing'), challenge_fee, consistency_rule_pct.
+    Optional: monthly_recurring (bool), risk_per_trade_dollar (float).
+
+    Returns a DataFrame with pass_rate, avg_days_to_pass, budget_95, etc.
+    """
+    if not firms:
+        raise ValueError("firms list is empty.")
+    n_sims = int(n_sims)
+    if n_sims < 1:
+        raise ValueError("n_sims must be positive.")
+
+    r_ratio_arr, day_codes, _, n_trades = _prepare_r_ratio(df)
+    if n_trades < 1:
+        raise ValueError("CSV has no rows.")
+
+    max_steps = int(min(n_trades, max_steps_cap))
+    if max_steps < 1:
+        raise ValueError("Not enough data to simulate.")
+
+    F = len(firms)
+    starting = np.array([float(f["starting_equity"]) for f in firms], dtype=float)
+    profit_target = np.array([float(f["profit_target"]) for f in firms], dtype=float)
+    max_loss = np.array([float(f["max_loss"]) for f in firms], dtype=float)
+    daily_loss = np.array([float(f["daily_loss"]) for f in firms], dtype=float)
+    consistency_pct = np.array([float(f["consistency_rule_pct"]) for f in firms], dtype=float)
+    challenge_fee = np.array([float(f["challenge_fee"]) for f in firms], dtype=float)
+    trailing = np.array([f.get("drawdown_type", "Static") == "Trailing" for f in firms], dtype=bool)
+
+    risk = np.array(
+        [
+            float(
+                f["risk_per_trade_dollar"]
+                if f.get("risk_per_trade_dollar") is not None
+                else max(1.0, int(0.005 * float(f["starting_equity"])))
+            )
+            for f in firms
+        ],
+        dtype=float,
+    )
+
+    target_balance = starting + profit_target
+    max_static_floor = starting - max_loss
+    consistency_cap = (consistency_pct / 100.0) * profit_target
+
+    rng = np.random.default_rng(seed)
+    S = n_sims
+
+    equity = np.tile(starting[:, np.newaxis], (1, S))
+    high_water = equity.copy()
+    outcome = np.full((F, S), -1, dtype=np.int8)
+    current_day = np.full((F, S), -1, dtype=np.int64)
+    day_start_equity = np.tile(starting[:, np.newaxis], (1, S))
+    daily_pnl = np.zeros((F, S), dtype=float)
+    trades_taken = np.zeros((F, S), dtype=np.int32)
+
+    target_bal = target_balance[:, np.newaxis]
+    daily_lim = daily_loss[:, np.newaxis]
+    cons_lim = consistency_cap[:, np.newaxis]
+    max_loss_b = max_loss[:, np.newaxis]
+    static_floor = max_static_floor[:, np.newaxis]
+
+    trade_pool_len = n_trades
+    for _step in range(max_steps):
+        active = outcome == -1
+        if not np.any(active):
+            break
+
+        sampled_idx = rng.integers(0, trade_pool_len, size=(F, S))
+        sampled_r = r_ratio_arr[sampled_idx]
+        sampled_day = day_codes[sampled_idx]
+
+        transitions = active & (sampled_day != current_day)
+        current_day[transitions] = sampled_day[transitions]
+        day_start_equity[transitions] = equity[transitions]
+        daily_pnl[transitions] = 0.0
+
+        pnl = risk[:, np.newaxis] * sampled_r
+        equity[active] = equity[active] + pnl[active]
+        daily_pnl[active] = daily_pnl[active] + pnl[active]
+        trades_taken[active] = trades_taken[active] + 1
+        np.maximum(high_water, equity, out=high_water)
+
+        success_mask = active & (equity >= target_bal)
+        outcome[success_mask] = 1
+
+        fail_daily = active & (daily_pnl <= -daily_lim)
+        trail_floor = high_water - max_loss_b
+        max_floor = np.where(trailing[:, np.newaxis], trail_floor, static_floor)
+        fail_max = active & (equity <= max_floor)
+        fail_cons = active & (daily_pnl > cons_lim)
+        fail_mask = (fail_daily | fail_max | fail_cons) & (~success_mask)
+        outcome[fail_mask] = 0
+
+    unresolved = outcome == -1
+    outcome[unresolved] = 0
+
+    rows: List[Dict[str, Any]] = []
+    names = [str(f["name"]) for f in firms]
+
+    for fi in range(F):
+        out = outcome[fi]
+        passed = out == 1
+        pr = float(np.mean(out == 1))
+        rr = float(np.mean(out == 0))
+        if np.any(passed):
+            avg_trades = float(np.mean(trades_taken[fi, passed]))
+        else:
+            avg_trades = float("nan")
+
+        fee = float(challenge_fee[fi])
+        if pr <= 0:
+            n95 = float("inf")
+        elif pr >= 1:
+            n95 = 1.0
+        else:
+            n95 = float(np.log(0.05) / np.log(1.0 - pr))
+
+        rows.append(
+            {
+                "Firm": names[fi],
+                "Pass Rate": pr,
+                "Fail Rate": rr,
+                "Avg Trades to Pass": avg_trades,
+                "Challenge Fee": fee,
+                "n95": n95,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
