@@ -1,12 +1,35 @@
+import inspect
 import io
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# Ensure we load `prop_strategy_engine.py` from this repo (same folder as app.py), not an older
+# package on PYTHONPATH — a common cause of "unexpected keyword argument 'funded_params'" on hosts.
+_REPO_ROOT = str(Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from prop_strategy_engine import run_prop_strategy_monte_carlo
+
+_ENGINE_SUPPORTS_FUNDED = "funded_params" in inspect.signature(run_prop_strategy_monte_carlo).parameters
+
+
+def _run_prop_strategy_monte_carlo(**kwargs):
+    """
+    Call the engine with only arguments accepted by the installed `run_prop_strategy_monte_carlo`.
+
+    Streamlit Community Cloud occasionally serves a stale checkout; an older engine without
+    `funded_params` would otherwise raise: unexpected keyword argument 'funded_params'.
+    """
+    sig = inspect.signature(run_prop_strategy_monte_carlo)
+    allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return run_prop_strategy_monte_carlo(**allowed)
 
 
 st.set_page_config(page_title="Prop Firm Strategy Simulation Engine", layout="wide")
@@ -425,6 +448,11 @@ with col_inputs:
 with col_outputs:
     st.markdown('<p class="pp-column-title">Results</p>', unsafe_allow_html=True)
     with st.container(border=True):
+        if not _ENGINE_SUPPORTS_FUNDED:
+            st.warning(
+                "This deployment is using an older `prop_strategy_engine` without `funded_params`. "
+                "Redeploy from the latest `main` so funded EV / payout metrics match localhost."
+            )
         if "last_result" not in st.session_state:
             st.session_state.last_result = None
         if "last_elapsed" not in st.session_state:
@@ -460,7 +488,7 @@ with col_outputs:
                     }
                     with st.spinner("Running challenge + funded Monte Carlo (50,000 sims)..."):
                         start = time.time()
-                        result = run_prop_strategy_monte_carlo(
+                        result = _run_prop_strategy_monte_carlo(
                             df=df,
                             starting_balance=float(account_size),
                             risk_per_trade_dollar=float(risk_per_trade),
