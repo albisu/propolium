@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,6 +56,133 @@ def _prepare_r_ratio(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, float, i
     return r_ratio_arr, day_codes, baseline_risk, int(len(df))
 
 
+def _run_funded_phase_vectorized(
+    rng: np.random.Generator,
+    r_ratio_arr: np.ndarray,
+    day_codes: np.ndarray,
+    *,
+    n_sims: int,
+    starting_balance: float,
+    risk_dollars_fixed: float,
+    max_loss_dollars: float,
+    daily_loss_dollars: float,
+    drawdown_type: Literal["Static", "Trailing"],
+    passed_mask: np.ndarray,
+    min_payout_buffer: float,
+    profit_split_pct: float,
+    funded_consistency_max_pct: float,
+    winning_day_profit_threshold: float,
+    min_winning_days: int,
+    max_steps: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Funded account: no profit target; exit on daily loss or max loss.
+    After first payout, max loss floor locks to starting balance (cannot dip below start).
+    Payout gates: equity >= start + buffer, winning_days >= min, max_daily/total_profit < consistency cap.
+    """
+    n = int(n_sims)
+    active = passed_mask.astype(bool).copy()
+    if not np.any(active):
+        return {
+            "total_payout": np.zeros(n, dtype=float),
+            "had_payout": np.zeros(n, dtype=bool),
+            "funded_calendar_days": np.zeros(n, dtype=float),
+            "funded_failed": np.zeros(n, dtype=bool),
+        }
+
+    equity = np.full(n, np.nan, dtype=float)
+    equity[active] = float(starting_balance)
+    high_water = np.full(n, np.nan, dtype=float)
+    high_water[active] = float(starting_balance)
+    current_day = np.full(n, -1, dtype=np.int64)
+    day_start_equity = np.full(n, np.nan, dtype=float)
+    day_start_equity[active] = float(starting_balance)
+    daily_pnl = np.zeros(n, dtype=float)
+
+    payout_lock = np.zeros(n, dtype=bool)
+    total_payout = np.zeros(n, dtype=float)
+    had_payout = np.zeros(n, dtype=bool)
+    winning_days = np.zeros(n, dtype=np.int32)
+    max_daily_profit = np.zeros(n, dtype=float)
+    funded_calendar_days = np.zeros(n, dtype=np.float32)
+    funded_failed = np.zeros(n, dtype=bool)
+
+    static_floor_val = float(starting_balance - max_loss_dollars)
+    daily_lim = float(daily_loss_dollars)
+    split_frac = float(profit_split_pct) / 100.0
+    cons_cap = float(funded_consistency_max_pct) / 100.0
+    start = float(starting_balance)
+    trailing = drawdown_type == "Trailing"
+
+    trade_pool_len = int(len(r_ratio_arr))
+
+    for _step in range(max_steps):
+        if not np.any(active):
+            break
+
+        sampled_idx = rng.integers(0, trade_pool_len, size=n)
+        sampled_r = r_ratio_arr[sampled_idx]
+        sampled_day = day_codes[sampled_idx]
+
+        transitions = active & (sampled_day != current_day)
+        if np.any(transitions):
+            old_close_mask = transitions & (current_day >= 0)
+            if np.any(old_close_mask):
+                closing = daily_pnl[old_close_mask]
+                winning_days[old_close_mask] += (closing > winning_day_profit_threshold).astype(np.int32)
+                max_daily_profit[old_close_mask] = np.maximum(max_daily_profit[old_close_mask], closing)
+                funded_calendar_days[old_close_mask] += 1.0
+
+            current_day[transitions] = sampled_day[transitions]
+            day_start_equity[transitions] = equity[transitions]
+            daily_pnl[transitions] = 0.0
+
+        pnl = risk_dollars_fixed * sampled_r
+        equity[active] = equity[active] + pnl[active]
+        daily_pnl[active] = daily_pnl[active] + pnl[active]
+        np.maximum(high_water, equity, out=high_water)
+
+        fail_daily = active & (daily_pnl <= -daily_lim)
+
+        trail_floor = high_water - max_loss_dollars
+        max_floor = np.where(trailing, trail_floor, static_floor_val)
+        max_floor = np.where(payout_lock, start, max_floor)
+        fail_max = active & (equity <= max_floor)
+
+        fail_mask = fail_daily | fail_max
+        if np.any(fail_mask):
+            funded_failed[fail_mask] = True
+            active[fail_mask] = False
+
+        if np.any(active):
+            profit = equity - start
+            ratio = max_daily_profit / np.maximum(profit, 1e-9)
+            consistency_ok = ratio < cons_cap
+            buffer_ok = equity >= (start + min_payout_buffer)
+            win_ok = winning_days >= min_winning_days
+            payout_ok = (
+                active
+                & buffer_ok
+                & win_ok
+                & consistency_ok
+                & (profit > 0.0)
+            )
+            if np.any(payout_ok):
+                total_payout[payout_ok] += split_frac * profit[payout_ok]
+                had_payout[payout_ok] = True
+                equity[payout_ok] = start
+                high_water[payout_ok] = start
+                payout_lock[payout_ok] = True
+                daily_pnl[payout_ok] = 0.0
+
+    return {
+        "total_payout": total_payout,
+        "had_payout": had_payout,
+        "funded_calendar_days": funded_calendar_days.astype(float),
+        "funded_failed": funded_failed,
+    }
+
+
 def run_prop_strategy_monte_carlo(
     *,
     df: pd.DataFrame,
@@ -70,6 +197,7 @@ def run_prop_strategy_monte_carlo(
     seed: int = 12345,
     config: EngineConfig = EngineConfig(),
     equity_paths: int = 50,
+    funded_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
     """
     Vectorized Monte Carlo:
@@ -205,6 +333,62 @@ def run_prop_strategy_monte_carlo(
     ruin_rate = float((outcome == 0).mean())
     avg_trades_to_pass = float(np.mean(trades_taken[passed_mask])) if np.any(passed_mask) else float("nan")
 
+    funded_metrics: Optional[Dict[str, Any]] = None
+    if funded_params is not None:
+        max_f = int(
+            min(
+                n_trades,
+                int(funded_params.get("max_steps_funded", config.max_steps_cap * 2)),
+            )
+        )
+        max_f = max(1, max_f)
+        funded_out = _run_funded_phase_vectorized(
+            rng,
+            r_ratio_arr,
+            day_codes,
+            n_sims=n_sims,
+            starting_balance=float(starting_balance),
+            risk_dollars_fixed=risk_dollars_fixed,
+            max_loss_dollars=max_loss_dollars,
+            daily_loss_dollars=daily_loss_dollars_static,
+            drawdown_type=drawdown_type,
+            passed_mask=passed_mask,
+            min_payout_buffer=float(funded_params["min_payout_buffer"]),
+            profit_split_pct=float(funded_params["profit_split_pct"]),
+            funded_consistency_max_pct=float(funded_params["funded_consistency_max_pct"]),
+            winning_day_profit_threshold=float(funded_params.get("winning_day_profit_threshold", 150.0)),
+            min_winning_days=int(funded_params.get("min_winning_days", 5)),
+            max_steps=max_f,
+        )
+        total_payout = funded_out["total_payout"]
+        had_payout = funded_out["had_payout"]
+        fund_days = funded_out["funded_calendar_days"]
+        funded_failed = funded_out["funded_failed"]
+
+        n_passed = int(np.sum(passed_mask))
+        avg_total_payout = float(np.sum(total_payout) / max(1, n_passed))
+        payout_prob = float(np.mean(had_payout))
+        net_ev = float(pass_rate * avg_total_payout - ruin_rate * float(challenge_fee))
+        roi_pct = float((net_ev / float(challenge_fee)) * 100.0) if float(challenge_fee) > 0 else float("nan")
+
+        failed_funded = passed_mask & funded_failed
+        if np.any(failed_funded):
+            avg_longevity = float(np.mean(fund_days[failed_funded]))
+        elif np.any(passed_mask):
+            avg_longevity = float(np.mean(fund_days[passed_mask]))
+        else:
+            avg_longevity = float("nan")
+
+        funded_metrics = {
+            "payout_probability": payout_prob,
+            "avg_total_payout_per_challenge_pass": avg_total_payout,
+            "net_ev": net_ev,
+            "roi_pct": roi_pct,
+            "avg_account_longevity_days": avg_longevity,
+            "funded_total_payout_per_sim": total_payout,
+            "payout_histogram_values": total_payout[passed_mask].astype(float).copy(),
+        }
+
     efficiency = float("inf") if pass_rate <= 0 else float(challenge_fee) / pass_rate
 
     target_drawdown_balance = float(max_total_loss_balance_static)
@@ -223,7 +407,7 @@ def run_prop_strategy_monte_carlo(
         last_valid = int(valid_idx.max()) if valid_idx.size else 0
         paths_list.append(row[: last_valid + 1].copy())
 
-    return {
+    out: Dict[str, Any] = {
         "pass_rate": pass_rate,
         "ruin_rate": ruin_rate,
         "avg_trades_to_pass": avg_trades_to_pass,
@@ -235,6 +419,9 @@ def run_prop_strategy_monte_carlo(
         "max_steps": max_steps,
         "n_sims": n_sims,
     }
+    if funded_metrics is not None:
+        out.update(funded_metrics)
+    return out
 
 
 def run_firm_comparison_batch(
