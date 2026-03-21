@@ -9,7 +9,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class EngineConfig:
-    n_sims: int = 250_000
+    n_sims: int = 50_000
     max_steps_cap: int = 1_200  # keep app responsive at 250k simulations
 
 
@@ -60,15 +60,12 @@ def run_prop_strategy_monte_carlo(
     *,
     df: pd.DataFrame,
     starting_balance: float,
-    risk_value: float,
-    risk_mode: Literal["percent", "dollar"],
-    target_value: float,
-    max_loss_value: float,
-    daily_loss_value: float,
-    value_mode: Literal["percent", "dollar"],
+    risk_per_trade_dollar: float,
+    profit_target_dollar: float,
+    max_loss_dollar: float,
+    daily_loss_dollar: float,
     drawdown_type: Literal["Static", "Trailing"],
     challenge_fee: float,
-    payout_split_pct: float,
     consistency_rule_pct: float,
     seed: int = 12345,
     config: EngineConfig = EngineConfig(),
@@ -88,20 +85,14 @@ def run_prop_strategy_monte_carlo(
     """
     if starting_balance <= 0:
         raise ValueError("Account Size must be > 0.")
-    if risk_value < 0:
+    if risk_per_trade_dollar < 0:
         raise ValueError("Risk per trade must be >= 0.")
-    if risk_mode not in {"percent", "dollar"}:
-        raise ValueError("risk_mode must be 'percent' or 'dollar'.")
-    if target_value < 0 or max_loss_value < 0 or daily_loss_value < 0:
+    if profit_target_dollar < 0 or max_loss_dollar < 0 or daily_loss_dollar < 0:
         raise ValueError("Target, Max Loss, and Daily Loss must be >= 0.")
-    if value_mode not in {"percent", "dollar"}:
-        raise ValueError("value_mode must be 'percent' or 'dollar'.")
     if drawdown_type not in {"Static", "Trailing"}:
         raise ValueError("drawdown_type must be 'Static' or 'Trailing'.")
     if challenge_fee < 0:
         raise ValueError("Challenge Fee must be >= 0.")
-    if not (0 <= payout_split_pct <= 100):
-        raise ValueError("Payout Split % must be between 0 and 100.")
     if consistency_rule_pct < 0:
         raise ValueError("Consistency Rule % must be >= 0.")
     if equity_paths <= 0:
@@ -118,21 +109,12 @@ def run_prop_strategy_monte_carlo(
 
     rng = np.random.default_rng(seed)
 
-    if value_mode == "percent":
-        target_profit_dollars = starting_balance * (target_value / 100.0)
-        max_loss_dollars = starting_balance * (max_loss_value / 100.0)
-        daily_loss_dollars_static = starting_balance * (daily_loss_value / 100.0)
-        daily_loss_is_percent = True
-    else:
-        target_profit_dollars = float(target_value)
-        max_loss_dollars = float(max_loss_value)
-        daily_loss_dollars_static = float(daily_loss_value)
-        daily_loss_is_percent = False
-
+    target_profit_dollars = float(profit_target_dollar)
+    max_loss_dollars = float(max_loss_dollar)
+    daily_loss_dollars_static = float(daily_loss_dollar)
     target_balance = starting_balance + target_profit_dollars
     max_total_loss_balance_static = starting_balance - max_loss_dollars
-    risk_frac = risk_value / 100.0
-    risk_dollars_fixed = float(risk_value)
+    risk_dollars_fixed = float(risk_per_trade_dollar)
     consistency_day_cap = (consistency_rule_pct / 100.0) * target_profit_dollars
 
     # Simulation state
@@ -142,6 +124,7 @@ def run_prop_strategy_monte_carlo(
     current_day = np.full(n_sims, -1, dtype=np.int64)
     day_start_equity = np.full(n_sims, float(starting_balance), dtype=float)
     daily_pnl = np.zeros(n_sims, dtype=float)
+    trades_taken = np.zeros(n_sims, dtype=np.int32)
 
     # Plot sample
     n_paths = int(min(max(1, equity_paths), n_sims))
@@ -172,15 +155,13 @@ def run_prop_strategy_monte_carlo(
             daily_pnl[transitions] = 0.0
 
         # Apply trade PnL to active sims
-        if risk_mode == "percent":
-            base_risk_dollars = equity * risk_frac
-        else:
-            base_risk_dollars = np.full(n_sims, risk_dollars_fixed, dtype=float)
+        base_risk_dollars = np.full(n_sims, risk_dollars_fixed, dtype=float)
         pnl = base_risk_dollars * sampled_r
 
         # Update only active
         equity[active] += pnl[active]
         daily_pnl[active] += pnl[active]
+        trades_taken[active] += 1
         np.maximum(high_water, equity, out=high_water)
 
         # Check success first (success wins over fail on same trade)
@@ -189,19 +170,12 @@ def run_prop_strategy_monte_carlo(
             outcome[success_mask] = 1
 
         # Fail conditions
-        if daily_loss_is_percent:
-            fail_daily_mask = active & (daily_pnl <= -(day_start_equity * (daily_loss_value / 100.0)))
-        else:
-            fail_daily_mask = active & (daily_pnl <= -daily_loss_dollars_static)
+        fail_daily_mask = active & (daily_pnl <= -daily_loss_dollars_static)
 
         if drawdown_type == "Static":
             max_floor = max_total_loss_balance_static
         else:
-            # trailing floor moves with high-water mark
-            if value_mode == "percent":
-                max_floor = high_water * (1.0 - max_loss_value / 100.0)
-            else:
-                max_floor = high_water - max_loss_dollars
+            max_floor = high_water - max_loss_dollars
 
         fail_max_mask = active & (equity <= max_floor)
         fail_consistency_mask = active & (daily_pnl > consistency_day_cap)
@@ -229,23 +203,13 @@ def run_prop_strategy_monte_carlo(
     passed_mask = outcome == 1
     pass_rate = float(passed_mask.mean())
     ruin_rate = float((outcome == 0).mean())
+    avg_trades_to_pass = float(np.mean(trades_taken[passed_mask])) if np.any(passed_mask) else float("nan")
 
-    # Payout model: payout split of realized profit (equity - starting_balance) on pass.
-    profits_on_pass = equity[passed_mask] - float(starting_balance)
-    payout_split = float(payout_split_pct) / 100.0
-    payouts_pass = payout_split * profits_on_pass
-    avg_payout = float(payouts_pass.mean()) if len(payouts_pass) else 0.0
-
-    net_ev = (pass_rate * avg_payout) - (ruin_rate * float(challenge_fee))
     efficiency = float("inf") if pass_rate <= 0 else float(challenge_fee) / pass_rate
 
     target_drawdown_balance = float(max_total_loss_balance_static)
     if drawdown_type == "Trailing":
-        # Chart marker for trailing mode: initial floor (will trail upward intrapath).
-        if value_mode == "percent":
-            target_drawdown_balance = float(starting_balance * (1.0 - max_loss_value / 100.0))
-        else:
-            target_drawdown_balance = float(starting_balance - max_loss_dollars)
+        target_drawdown_balance = float(starting_balance - max_loss_dollars)
 
     # Build list of plot paths for Plotly (slice until last non-nan)
     passed_paths = np.array([bool(o == 1) for o in plot_outcome], dtype=bool)
@@ -262,8 +226,7 @@ def run_prop_strategy_monte_carlo(
     return {
         "pass_rate": pass_rate,
         "ruin_rate": ruin_rate,
-        "avg_payout": avg_payout,
-        "net_ev": net_ev,
+        "avg_trades_to_pass": avg_trades_to_pass,
         "efficiency_total_cost_to_fund": efficiency,
         "target_balance": float(target_balance),
         "max_drawdown_balance": target_drawdown_balance,
