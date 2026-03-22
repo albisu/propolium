@@ -643,34 +643,71 @@ with col_outputs:
                 "Net EV = (pass rate × avg. total payout) − (challenge fail rate × challenge fee). "
                 "Avg. payout is over simulations that passed the challenge."
             )
-            f1, f2, f3, f4 = st.columns(4, gap="small")
-            f1.metric(
-                "PAYOUT PROBABILITY",
-                _fmt_percent(float(fr.get("payout_probability", 0.0))),
-                help="Share of all simulations where the funded account reached at least one payout.",
+            # Backward compat: older engine used payout_probability (= absolute rate only).
+            _p_abs = fr.get("payout_success_rate_absolute", fr.get("payout_probability"))
+            _p_cond = fr.get("payout_success_rate_conditional")
+            if _p_cond is None and _p_abs is not None:
+                p_pass = float(fr.get("pass_rate", 0.0))
+                _p_cond = float(_p_abs) / p_pass if p_pass > 1e-12 else 0.0
+            _p_abs_f = float(_p_abs) if _p_abs is not None else 0.0
+            _p_cond_f = float(_p_cond) if _p_cond is not None else 0.0
+
+            m1, m2, m3 = st.columns(3, gap="small")
+            m1.metric(
+                "PAYOUT SUCCESS RATE (CONDITIONAL)",
+                _fmt_percent(_p_cond_f),
+                help=(
+                    "(Accounts with ≥1 funded payout) ÷ (challenge passes). "
+                    "Survival rate among funded accounts — how often you withdraw once funded."
+                ),
             )
-            f2.metric(
+            m2.metric(
+                "TOTAL SUCCESS RATE (ABSOLUTE)",
+                _fmt_percent(_p_abs_f),
+                help="(Accounts with ≥1 funded payout) ÷ (all simulations). Ground-truth probability of making a payout.",
+            )
+            _sf = fr.get("survival_factor", float("nan"))
+            sf_txt = f"{float(_sf):.3f}" if _sf is not None and np.isfinite(float(_sf)) else "n/a"
+            m3.metric(
+                "SURVIVAL FACTOR",
+                sf_txt,
+                help=(
+                    "Avg. funded PnL ÷ avg. challenge PnL (both over challenge passes). "
+                    "> 1: funded phase is stronger vs challenge profit; < 1: fragile under funded rules."
+                ),
+            )
+
+            g1, g2, g3 = st.columns(3, gap="small")
+            g1.metric(
                 "ACCOUNT LONGEVITY (DAYS)",
                 f"{float(fr.get('avg_account_longevity_days', float('nan'))):.2f}"
                 if np.isfinite(fr.get("avg_account_longevity_days", float("nan")))
                 else "n/a",
                 help="Average funded calendar days before blow-up (among accounts that failed in funded phase).",
             )
-            f3.metric(
+            g2.metric(
                 "TOTAL NET EV ($)",
                 _fmt_dollars(float(fr.get("net_ev", float("nan")))),
                 help=ev_help,
             )
-            f4.metric(
+            g3.metric(
                 "ROI vs FEE (%)",
                 f"{float(fr.get('roi_pct', float('nan'))):.2f}%"
                 if np.isfinite(fr.get("roi_pct", float("nan")))
                 else "n/a",
                 help="(Net EV / challenge fee) × 100.",
             )
-            st.caption(
-                f"Avg. total payout (conditional on challenge pass): {_fmt_dollars(float(fr.get('avg_total_payout_per_challenge_pass', 0.0)))}"
-            )
+            _af = fr.get("avg_funded_pnl")
+            _ac = fr.get("avg_challenge_pnl")
+            if _af is not None and _ac is not None and np.isfinite(float(_af)) and np.isfinite(float(_ac)):
+                st.caption(
+                    f"Avg. funded PnL (withdrawals per challenge pass): {_fmt_dollars(float(_af))} · "
+                    f"Avg. challenge PnL at pass: {_fmt_dollars(float(_ac))}"
+                )
+            else:
+                st.caption(
+                    f"Avg. total payout (conditional on challenge pass): {_fmt_dollars(float(fr.get('avg_total_payout_per_challenge_pass', 0.0)))}"
+                )
             ph = fr.get("payout_histogram_values")
             if ph is not None and len(ph) > 0:
                 fig_hist = go.Figure(

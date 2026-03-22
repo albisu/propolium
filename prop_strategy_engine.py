@@ -253,6 +253,8 @@ def run_prop_strategy_monte_carlo(
     day_start_equity = np.full(n_sims, float(starting_balance), dtype=float)
     daily_pnl = np.zeros(n_sims, dtype=float)
     trades_taken = np.zeros(n_sims, dtype=np.int32)
+    # Equity gain at the moment the challenge is passed (for funded vs challenge PnL comparison).
+    challenge_pnl_dollars = np.full(n_sims, np.nan, dtype=float)
 
     # Plot sample
     n_paths = int(min(max(1, equity_paths), n_sims))
@@ -295,6 +297,7 @@ def run_prop_strategy_monte_carlo(
         # Check success first (success wins over fail on same trade)
         success_mask = active & (equity >= target_balance)
         if np.any(success_mask):
+            challenge_pnl_dollars[success_mask] = equity[success_mask] - float(starting_balance)
             outcome[success_mask] = 1
 
         # Fail conditions
@@ -367,7 +370,17 @@ def run_prop_strategy_monte_carlo(
 
         n_passed = int(np.sum(passed_mask))
         avg_total_payout = float(np.sum(total_payout) / max(1, n_passed))
-        payout_prob = float(np.mean(had_payout))
+        payouts_achieved = int(np.sum(had_payout))
+        payout_success_rate_conditional = float(payouts_achieved / max(1, n_passed))
+        payout_success_rate_absolute = float(payouts_achieved / float(n_sims))
+
+        avg_funded_pnl = float(np.mean(total_payout[passed_mask])) if np.any(passed_mask) else float("nan")
+        avg_challenge_pnl = float(np.nanmean(challenge_pnl_dollars[passed_mask])) if np.any(passed_mask) else float("nan")
+        if np.isfinite(avg_challenge_pnl) and avg_challenge_pnl > 1e-12:
+            survival_factor = float(avg_funded_pnl / avg_challenge_pnl)
+        else:
+            survival_factor = float("nan")
+
         net_ev = float(pass_rate * avg_total_payout - ruin_rate * float(challenge_fee))
         roi_pct = float((net_ev / float(challenge_fee)) * 100.0) if float(challenge_fee) > 0 else float("nan")
 
@@ -380,7 +393,11 @@ def run_prop_strategy_monte_carlo(
             avg_longevity = float("nan")
 
         funded_metrics = {
-            "payout_probability": payout_prob,
+            "payout_success_rate_conditional": payout_success_rate_conditional,
+            "payout_success_rate_absolute": payout_success_rate_absolute,
+            "survival_factor": survival_factor,
+            "avg_funded_pnl": avg_funded_pnl,
+            "avg_challenge_pnl": avg_challenge_pnl,
             "avg_total_payout_per_challenge_pass": avg_total_payout,
             "net_ev": net_ev,
             "roi_pct": roi_pct,
