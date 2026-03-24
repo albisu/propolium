@@ -222,11 +222,13 @@ def _strategy_metrics_from_df(df: pd.DataFrame) -> dict[str, float]:
 TEMPLATE_CUSTOM = "custom"
 TEMPLATE_TOPSTEP_STANDARD = "topstep_express_standard"
 TEMPLATE_TOPSTEP_CONSISTENCY = "topstep_express_consistency"
+TEMPLATE_FOREX = "forex"
 
 TEMPLATE_LABELS: dict[str, str] = {
     TEMPLATE_CUSTOM: "Custom (manual)",
     TEMPLATE_TOPSTEP_STANDARD: "Topstep Express — Standard payout",
     TEMPLATE_TOPSTEP_CONSISTENCY: "Topstep Express — Consistency payout",
+    TEMPLATE_FOREX: "Forex (Phase 1 & 2)",
 }
 
 
@@ -250,6 +252,17 @@ def _apply_template_fields(template_id: str) -> None:
         st.session_state.funded_min_days = 5
     elif template_id == TEMPLATE_TOPSTEP_CONSISTENCY:
         st.session_state.funded_min_days = 3
+    elif template_id == TEMPLATE_FOREX:
+        st.session_state.starting_equity = 100000
+        st.session_state.risk_per_trade = 500
+        st.session_state.profit_target_phase1 = 10000
+        st.session_state.profit_target_phase2 = 5000
+        st.session_state.max_loss = 10000
+        st.session_state.daily_loss = 5000
+        st.session_state.profit_target = 10000  # fallback when switching away
+        st.session_state.activation_fee = 0
+        st.session_state.consistency_rule_pct = 0
+        st.session_state.monthly_recurring = False
 
 
 def _sync_template_on_change() -> None:
@@ -313,6 +326,24 @@ def _funded_params_for_template(template_id: str, ui_funded_min_days: int, ui_fu
                 "min_payout_request_dollars": 125.0,
             }
         )
+    elif template_id == TEMPLATE_FOREX:
+        base.update(
+            {
+                "min_payout_buffer": 0.0,
+                "funded_consistency_max_pct": 100.0,
+                "winning_day_profit_threshold": 1.0,
+                "min_winning_days": 0,
+                "min_trading_days_for_payout": 0,
+                "max_payout_cap_dollars": 1.0e12,
+                "max_payout_frac_of_equity": 0.5,
+                "funded_payout_consistency_gate": False,
+                "payout_withdrawal_request_model": False,
+                "express_funded_path": None,
+                "min_consistency_calendar_days": 0,
+                "payout_processing_fee_dollars": 0.0,
+                "min_payout_request_dollars": 0.0,
+            }
+        )
     return base
 
 
@@ -331,6 +362,9 @@ def _init_defaults() -> None:
     st.session_state.setdefault("funded_consistency_max", 40)
     st.session_state.setdefault("funded_min_days", 5)
     st.session_state.setdefault("funded_risk_per_trade", 250)
+    st.session_state.setdefault("profit_target_phase1", 8000)
+    st.session_state.setdefault("profit_target_phase2", 5000)
+    st.session_state.setdefault("last_run_template", None)
 
 
 _init_defaults()
@@ -344,12 +378,12 @@ with col_inputs:
 
     st.selectbox(
         "Configuration template",
-        options=[TEMPLATE_CUSTOM, TEMPLATE_TOPSTEP_STANDARD, TEMPLATE_TOPSTEP_CONSISTENCY],
+        options=[TEMPLATE_CUSTOM, TEMPLATE_TOPSTEP_STANDARD, TEMPLATE_TOPSTEP_CONSISTENCY, TEMPLATE_FOREX],
         format_func=lambda x: TEMPLATE_LABELS[x],
         key="config_template",
         help=(
-            "Topstep Express templates align funded payouts with the Express Funded payout policy "
-            "(Standard vs Consistency). See Topstep Help: Payout Policy."
+            "Topstep Express: payout policy (Standard vs Consistency). "
+            "Forex: two-phase challenge with separate Phase 1 & Phase 2 profit targets."
         ),
     )
     _sync_template_on_change()
@@ -379,49 +413,98 @@ with col_inputs:
             )
 
         st.markdown("**2 · Challenge limits**")
-        lm1, lm2, lm3 = st.columns(3)
-        with lm1:
-            profit_target = st.number_input(
-                "Profit target ($)",
-                min_value=0,
-                step=100,
-                format="%d",
-                key="profit_target",
-                help="Profit required to pass the challenge.",
+        _tpl = st.session_state.get("config_template", TEMPLATE_CUSTOM)
+        if _tpl == TEMPLATE_FOREX:
+            lm1, lm2, lm3, lm4 = st.columns(4)
+            with lm1:
+                profit_target_phase1 = st.number_input(
+                    "Phase 1 target ($)",
+                    min_value=0,
+                    step=100,
+                    format="%d",
+                    key="profit_target_phase1",
+                    help="Profit required to pass Phase 1 (then Phase 2 starts from starting balance).",
+                )
+            with lm2:
+                profit_target_phase2 = st.number_input(
+                    "Phase 2 target ($)",
+                    min_value=0,
+                    step=100,
+                    format="%d",
+                    key="profit_target_phase2",
+                    help="Profit required in Phase 2 (verification) to pass the full challenge.",
+                )
+            with lm3:
+                max_loss = st.number_input("Max loss ($)", min_value=0, step=100, format="%d", key="max_loss")
+            with lm4:
+                daily_loss = st.number_input("Daily loss ($)", min_value=0, step=100, format="%d", key="daily_loss")
+            profit_target = profit_target_phase1  # fallback for any legacy path
+            st.caption(
+                "Phase 1 & 2: hit Phase 1 target, then Phase 2 (verification) starts from starting balance."
             )
-        with lm2:
-            max_loss = st.number_input("Max loss ($)", min_value=0, step=100, format="%d", key="max_loss")
-        with lm3:
-            daily_loss = st.number_input("Daily loss ($)", min_value=0, step=100, format="%d", key="daily_loss")
+        else:
+            lm1, lm2, lm3 = st.columns(3)
+            with lm1:
+                profit_target = st.number_input(
+                    "Profit target ($)",
+                    min_value=0,
+                    step=100,
+                    format="%d",
+                    key="profit_target",
+                    help="Profit required to pass the challenge.",
+                )
+            with lm2:
+                max_loss = st.number_input("Max loss ($)", min_value=0, step=100, format="%d", key="max_loss")
+            with lm3:
+                daily_loss = st.number_input("Daily loss ($)", min_value=0, step=100, format="%d", key="daily_loss")
 
         st.markdown("**3 · Rules**")
+        _tpl_rules = st.session_state.get("config_template", TEMPLATE_CUSTOM)
         ru1, ru2 = st.columns(2)
         with ru1:
             drawdown_type = st.selectbox("Drawdown type", options=["Static", "Trailing"], key="drawdown_type")
         with ru2:
-            consistency_rule_pct = st.number_input(
-                "Consistency rule (%)", min_value=0, step=1, format="%d", key="consistency_rule_pct"
-            )
+            if _tpl_rules == TEMPLATE_FOREX:
+                st.caption("Consistency rule: **off** (forex challenge).")
+                consistency_rule_pct = int(st.session_state.get("consistency_rule_pct", 0))
+            else:
+                consistency_rule_pct = st.number_input(
+                    "Consistency rule (%)", min_value=0, step=1, format="%d", key="consistency_rule_pct"
+                )
 
         st.markdown("**4 · Fees**")
-        fe1, fe2, fe3 = st.columns(3)
-        with fe1:
-            challenge_fee = st.number_input("Challenge fee ($)", min_value=0, step=1, format="%d", key="challenge_fee")
-        with fe2:
-            activation_fee = st.number_input(
-                "Activation fee ($)",
-                min_value=0,
-                step=1,
-                format="%d",
-                key="activation_fee",
-                help="Paid after you pass the challenge. Included in expected cost to reach funded.",
-            )
-        with fe3:
+        _tpl_fees = st.session_state.get("config_template", TEMPLATE_CUSTOM)
+        if _tpl_fees == TEMPLATE_FOREX:
+            fe1, fe2 = st.columns(2)
+            with fe1:
+                challenge_fee = st.number_input("Challenge fee ($)", min_value=0, step=1, format="%d", key="challenge_fee")
+            with fe2:
+                st.caption("Activation fee: **none** (forex). Cost to pass = challenge attempts only.")
+            activation_fee = 0
             monthly_recurring = st.checkbox(
                 "Monthly recurring",
                 key="monthly_recurring",
                 help="If on, each challenge attempt is billed as fee × max(1, months to pass) for budgeting.",
             )
+        else:
+            fe1, fe2, fe3 = st.columns(3)
+            with fe1:
+                challenge_fee = st.number_input("Challenge fee ($)", min_value=0, step=1, format="%d", key="challenge_fee")
+            with fe2:
+                activation_fee = st.number_input(
+                    "Activation fee ($)",
+                    min_value=0,
+                    step=1,
+                    format="%d",
+                    key="activation_fee",
+                    help="Paid after you pass the challenge. Included in expected cost to reach funded.",
+                )
+            with fe3:
+                monthly_recurring = st.checkbox(
+                    "Monthly recurring",
+                    key="monthly_recurring",
+                    help="If on, each challenge attempt is billed as fee × max(1, months to pass) for budgeting.",
+                )
 
     with st.container(border=True):
         st.markdown(
@@ -430,8 +513,8 @@ with col_inputs:
         )
         st.caption("Parameters used **after** you pass the challenge — funded-phase simulation only.")
 
-        fp1, fp2, fp3 = st.columns(3)
-        with fp1:
+        _tpl_fd = st.session_state.get("config_template", TEMPLATE_CUSTOM)
+        if _tpl_fd == TEMPLATE_FOREX:
             funded_risk_per_trade = st.number_input(
                 "Funded Risk per Trade ($)",
                 min_value=0,
@@ -440,36 +523,57 @@ with col_inputs:
                 key="funded_risk_per_trade",
                 help="Used in the funded phase only; challenge phase uses Risk per Trade.",
             )
-        with fp2:
-            funded_min_days = st.number_input(
-                "Minimum days",
-                min_value=0,
-                max_value=365,
-                step=1,
-                format="%d",
-                key="funded_min_days",
-                help=(
-                    "Custom: winning-day gate (min_winning_days). "
-                    "Topstep Standard: five $150+ winning days per payout cycle (default 5). "
-                    "Topstep Consistency: minimum calendar days per cycle with 40% consistency (default 3, at least 3)."
-                ),
+            funded_min_days = 0
+            funded_consistency_max = 100
+            st.caption(
+                "Forex: no minimum winning days or funded consistency gate — only **funded risk per trade** applies."
             )
-        with fp3:
-            funded_consistency_max = st.number_input(
-                "Funded consistency cap (%)",
-                min_value=1,
-                max_value=100,
-                step=1,
-                format="%d",
-                key="funded_consistency_max",
-                help="Max daily profit ÷ total profit must stay below this value in funded phase.",
-            )
+        else:
+            fp1, fp2, fp3 = st.columns(3)
+            with fp1:
+                funded_risk_per_trade = st.number_input(
+                    "Funded Risk per Trade ($)",
+                    min_value=0,
+                    step=10,
+                    format="%d",
+                    key="funded_risk_per_trade",
+                    help="Used in the funded phase only; challenge phase uses Risk per Trade.",
+                )
+            with fp2:
+                funded_min_days = st.number_input(
+                    "Minimum days",
+                    min_value=0,
+                    max_value=365,
+                    step=1,
+                    format="%d",
+                    key="funded_min_days",
+                    help=(
+                        "Custom: winning-day gate (min_winning_days). "
+                        "Topstep Standard: five $150+ winning days per payout cycle (default 5). "
+                        "Topstep Consistency: minimum calendar days per cycle with 40% consistency (default 3, at least 3)."
+                    ),
+                )
+            with fp3:
+                funded_consistency_max = st.number_input(
+                    "Funded consistency cap (%)",
+                    min_value=1,
+                    max_value=100,
+                    step=1,
+                    format="%d",
+                    key="funded_consistency_max",
+                    help="Max daily profit ÷ total profit must stay below this value in funded phase.",
+                )
 
         _ct = st.session_state.get("config_template", TEMPLATE_CUSTOM)
         if _ct == TEMPLATE_CUSTOM:
             st.caption(
                 "Custom template: legacy funded payout model (buffer, cumulative winning days, optional consistency on "
                 "lifetime funded profit). 90/10 split and withdrawal-style caps can be enabled in code via `funded_params`."
+            )
+        elif _ct == TEMPLATE_FOREX:
+            st.caption(
+                "Forex template: funded phase uses your **risk per trade** and standard payout split/caps only "
+                "(no Topstep Express payout policy)."
             )
         else:
             st.caption(
@@ -517,6 +621,7 @@ with col_outputs:
                     trades_per_day = df.groupby(dt.dt.normalize()).size()
                     avg_trades_per_day = float(trades_per_day.mean()) if len(trades_per_day) else float("nan")
 
+                    _tpl_run = st.session_state.get("config_template", TEMPLATE_CUSTOM)
                     mc_kw = dict(
                         df=df,
                         starting_balance=float(account_size),
@@ -530,8 +635,15 @@ with col_outputs:
                         equity_paths=50,
                         funded_risk_per_trade_dollar=float(funded_risk_per_trade),
                     )
+                    if _tpl_run == TEMPLATE_FOREX:
+                        p1 = float(st.session_state.get("profit_target_phase1", 0))
+                        p2 = float(st.session_state.get("profit_target_phase2", 0))
+                        mc_kw["profit_target_phase1_dollar"] = p1
+                        mc_kw["profit_target_phase2_dollar"] = p2
+                        mc_kw["profit_target_dollar"] = p1  # validation fallback
+                        mc_kw["apply_challenge_consistency_gate"] = False
 
-                    _tpl = st.session_state.get("config_template", TEMPLATE_CUSTOM)
+                    _tpl = _tpl_run
                     funded_params = _funded_params_for_template(
                         _tpl,
                         int(funded_min_days),
@@ -588,16 +700,18 @@ with col_outputs:
                         else n95 * cost_per_attempt
                     )
                     if pass_rate > 1e-12 and np.isfinite(cost_per_attempt):
-                        projected_challenge_fees = float(cost_per_attempt) / pass_rate
+                        attempts_needed = int(np.ceil(1.0 / pass_rate))
+                        projected_challenge_fees = float(attempts_needed) * float(cost_per_attempt)
                     else:
                         projected_challenge_fees = float("inf")
 
-                    activation_fee_f = float(activation_fee)
+                    activation_fee_f = 0.0 if _tpl_run == TEMPLATE_FOREX else float(activation_fee)
                     if np.isfinite(projected_challenge_fees):
                         expected_cost_to_funded = float(projected_challenge_fees) + activation_fee_f
                     else:
                         expected_cost_to_funded = float("inf")
 
+                    st.session_state.last_run_template = _tpl_run
                     st.session_state.last_result = result
                     st.session_state.last_elapsed = elapsed
                     st.session_state.last_time_to_pass_days = time_to_pass_days
@@ -615,6 +729,7 @@ with col_outputs:
                 except Exception as e:
                     st.session_state.last_error = str(e)
                     st.session_state.last_result = None
+                    st.session_state.last_run_template = None
                     st.session_state.last_cost_metrics = None
                     st.session_state.last_expected_days_to_pass_retries = None
                     st.session_state.last_projected_challenge_fees = None
@@ -630,12 +745,15 @@ with col_outputs:
             "accounting for the length of time it takes to pass and your specific failure rate."
         )
         projected_fees_help = (
-            "Expected **challenge** spend until first pass: (cost per attempt) ÷ pass rate. "
-            "Cost per attempt uses challenge fee × months if Monthly Recurring is on, else flat fee."
+            "Cost of attempts to pass using rounded-up attempts: ceil(1 / pass rate) × cost per attempt. "
+            "Cost per attempt = challenge fee × months if Monthly Recurring is on, else flat fee."
         )
         expected_cost_help = (
-            "Expected $ to get **funded**: E[challenge attempts] × cost per attempt + **activation fee** "
-            "after pass. Same as Projected Fees to First Pass + Activation Fee from inputs."
+            "Expected $ to get **funded**: cost of attempts to pass + **activation fee** "
+            "after pass. Same as Cost of Attempts to Pass + Activation Fee from inputs."
+        )
+        expected_cost_help_forex = (
+            "Expected $ to reach funded (forex): **challenge attempt costs only** — no activation fee."
         )
 
         tab_challenge, tab_funded, tab_metrics = st.tabs(["Challenge", "Funded", "Metrics"])
@@ -649,7 +767,7 @@ with col_outputs:
                 c2.metric("AVG TIME TO PASS (DAYS)", "—")
                 c3, c4 = st.columns(2)
                 c3.metric("EXPECTED TIME TO PASS (DAYS)", "—")
-                c4.metric("PROJECTED FEES TO FIRST PASS ($)", "—")
+                c4.metric("COST OF ATTEMPTS TO PASS ($)", "—")
             else:
                 result = st.session_state.last_result
                 c0.metric("PASS RATE (%)", _fmt_percent(float(result["pass_rate"])))
@@ -676,7 +794,7 @@ with col_outputs:
                 )
                 _pf = st.session_state.last_projected_challenge_fees
                 c4.metric(
-                    "PROJECTED FEES TO FIRST PASS ($)",
+                    "COST OF ATTEMPTS TO PASS ($)",
                     _fmt_dollars(_pf) if _pf is not None and np.isfinite(float(_pf)) else ("∞" if _pf is not None and np.isposinf(float(_pf)) else "n/a"),
                     help=projected_fees_help,
                 )
@@ -753,23 +871,44 @@ with col_outputs:
 
         with tab_funded:
             st.markdown("##### Funded economics")
-            st.caption(
-                "**Drawdown lock:** After the first funded payout request, max-loss floor locks to the funded "
-                "starting balance (e.g. $50k Topstep) and does not trail lower. "
-                "**90/10 split:** Withdrawals use your profit split (default **90%** trader / **10%** firm)."
+            _fund_tpl = st.session_state.get("last_run_template") or st.session_state.get(
+                "config_template", TEMPLATE_CUSTOM
             )
+            st.caption(
+                "Funded phase uses the **same** max loss ($), daily loss ($), and drawdown type (static / trailing) "
+                "as the challenge. **90/10** split on withdrawals unless your template says otherwise."
+            )
+            if _fund_tpl == TEMPLATE_FOREX:
+                st.caption("Forex: no Topstep payout rules. Drawdown lock after first payout still applies in the engine.")
+            else:
+                st.caption(
+                    "**Drawdown lock:** After the first funded payout request, max-loss floor locks to the funded "
+                    "starting balance (e.g. $50k Topstep) and does not trail lower."
+                )
             if st.session_state.last_result is None or "net_ev" not in st.session_state.last_result:
-                f0, f1, f2 = st.columns(3)
-                f0.metric("PAYOUT SUCCESS (CONDITIONAL)", "—")
-                f1.metric("FUNDED BLOWUP BEFORE PAYOUT", "—")
-                f2.metric("PAYOUT SUCCESS (ABSOLUTE)", "—")
-                g0, g1, g2 = st.columns(3)
-                g0.metric("AVG TOTAL PAYOUT ($)", "—")
-                g1.metric("NET EV ($)", "—")
-                g2.metric("EXPECTED COST TO FUNDED ($)", "—")
-                t0, t1 = st.columns(2)
-                t0.metric("TIME TO BREAKEVEN (FUNDED START, DAYS)", "—")
-                t1.metric("TIME TO BREAKEVEN (CHALLENGE START, DAYS)", "—")
+                if _fund_tpl == TEMPLATE_FOREX:
+                    fx0, fx1, fx2 = st.columns(3)
+                    fx0.metric("PAYOUT SUCCESS (CONDITIONAL)", "—")
+                    fx1.metric("NET EV ($)", "—")
+                    fx2.metric("AVG TOTAL PAYOUT ($)", "—")
+                    fxa0, fxa1 = st.columns(2)
+                    fxa0.metric("BREAKEVEN ATTEMPT COST (FUNDED START, DAYS)", "—")
+                    fxa1.metric("BREAKEVEN ATTEMPT COST (CHALLENGE START, DAYS)", "—")
+                else:
+                    f0, f1, f2 = st.columns(3)
+                    f0.metric("PAYOUT SUCCESS (CONDITIONAL)", "—")
+                    f1.metric("FUNDED BLOWUP BEFORE PAYOUT", "—")
+                    f2.metric("PAYOUT SUCCESS (ABSOLUTE)", "—")
+                    g0, g1, g2 = st.columns(3)
+                    g0.metric("AVG TOTAL PAYOUT ($)", "—")
+                    g1.metric("NET EV ($)", "—")
+                    g2.metric("EXPECTED COST TO FUNDED ($)", "—")
+                    t0, t1 = st.columns(2)
+                    t0.metric("TIME TO BREAKEVEN (FUNDED START, DAYS)", "—")
+                    t1.metric("TIME TO BREAKEVEN (CHALLENGE START, DAYS)", "—")
+                    ta0, ta1 = st.columns(2)
+                    ta0.metric("BREAKEVEN ATTEMPT COST (FUNDED START, DAYS)", "—")
+                    ta1.metric("BREAKEVEN ATTEMPT COST (CHALLENGE START, DAYS)", "—")
                 st.caption("Run the simulation to populate funded metrics and the payout chart.")
             else:
                 fr = st.session_state.last_result
@@ -793,90 +932,143 @@ with col_outputs:
                 _breakeven_days_from_funded = float("nan")
                 _breakeven_days_from_challenge = float("nan")
                 _breakeven_help_funded = (
-                    "Conditional expected funded-account time to breakeven of all upfront costs "
-                    "(projected challenge spend + activation fee), among simulations that actually breakeven. "
-                    "Computed from funded start only."
+                    "Conditional mean funded survival days until total funded payouts ≥ **expected cost to funded** "
+                    "(attempt fees + activation when applicable), among simulations that reach that threshold."
                 )
                 _breakeven_help_challenge = (
-                    "Conditional expected time from initial challenge purchase to breakeven of all upfront costs "
-                    "(projected challenge spend + activation fee), among simulations that actually breakeven. "
-                    "Computed as expected days to first pass (with retries) + funded-account breakeven time."
+                    "Same as funded-start full-cost breakeven, plus expected days to first pass with retries "
+                    "(E[attempts] × challenge fee path from the Challenge tab)."
+                )
+                _eca = costs.get("expected_challenge_spend", float("nan"))
+                _breakeven_attempts_funded = float("nan")
+                _breakeven_attempts_challenge = float("nan")
+                _breakeven_attempt_help_funded = (
+                    "Conditional mean funded survival days until total funded payouts ≥ **cost of attempts to pass** "
+                    "only (Challenge tab: COST OF ATTEMPTS TO PASS ($)), among simulations that reach that threshold."
+                )
+                _breakeven_attempt_help_challenge = (
+                    "Attempt-cost breakeven from funded start, plus expected days to first pass with retries."
                 )
                 _payout_arr = fr.get("funded_total_payout_per_sim")
                 _fund_days_arr = fr.get("funded_survival_days_per_sim")
-                if (
-                    _payout_arr is not None
-                    and _fund_days_arr is not None
-                    and _ecf is not None
-                    and np.isfinite(float(_ecf))
-                ):
+                if _payout_arr is not None and _fund_days_arr is not None:
                     payout_arr = np.asarray(_payout_arr, dtype=float)
                     fund_days_arr = np.asarray(_fund_days_arr, dtype=float)
                     valid = np.isfinite(payout_arr) & np.isfinite(fund_days_arr)
-                    mask = valid & (payout_arr >= float(_ecf))
-                    if np.any(mask):
-                        _breakeven_days_from_funded = float(np.mean(fund_days_arr[mask]))
-                        if _etr_days is not None and np.isfinite(float(_etr_days)):
-                            _breakeven_days_from_challenge = float(_etr_days) + _breakeven_days_from_funded
+                    if _ecf is not None and np.isfinite(float(_ecf)):
+                        mask_full = valid & (payout_arr >= float(_ecf))
+                        if np.any(mask_full):
+                            _breakeven_days_from_funded = float(np.mean(fund_days_arr[mask_full]))
+                            if _etr_days is not None and np.isfinite(float(_etr_days)):
+                                _breakeven_days_from_challenge = float(_etr_days) + _breakeven_days_from_funded
+                    if _eca is not None and np.isfinite(float(_eca)):
+                        mask_att = valid & (payout_arr >= float(_eca))
+                        if np.any(mask_att):
+                            _breakeven_attempts_funded = float(np.mean(fund_days_arr[mask_att]))
+                            if _etr_days is not None and np.isfinite(float(_etr_days)):
+                                _breakeven_attempts_challenge = float(_etr_days) + _breakeven_attempts_funded
 
-                f0, f1, f2 = st.columns(3)
-                f0.metric(
-                    "PAYOUT SUCCESS (CONDITIONAL)",
-                    _fmt_percent(_p_cond_f),
-                    help="Among challenge passes, share that reach ≥1 funded payout.",
+                _run_tpl = st.session_state.get("last_run_template") or st.session_state.get(
+                    "config_template", TEMPLATE_CUSTOM
                 )
-                f1.metric(
-                    "FUNDED BLOWUP BEFORE PAYOUT",
-                    _fmt_percent(_blow_cond) if np.isfinite(_blow_cond) else "n/a",
-                    help=(
-                        "Among challenge passes, probability of failing the funded account "
-                        "before receiving the first payout. Sensitive to funded risk per trade."
-                    ),
-                )
-                f2.metric(
-                    "PAYOUT SUCCESS (ABSOLUTE)",
-                    _fmt_percent(_p_abs_f),
-                    help="(Simulations with ≥1 funded payout) ÷ all simulations.",
-                )
-                g0, g1, g2 = st.columns(3)
-                g0.metric(
-                    "AVG TOTAL PAYOUT ($)",
-                    _fmt_dollars(_avg_pay) if np.isfinite(_avg_pay) else "n/a",
-                    help="User withdrawals in funded phase ÷ challenge passes (after split rules).",
-                )
-                g1.metric(
-                    "NET EV ($)",
-                    _fmt_dollars(_net_ev) if np.isfinite(_net_ev) else "n/a",
-                    help=ev_help,
-                )
-                g2.metric(
-                    "EXPECTED COST TO FUNDED ($)",
-                    _fmt_dollars(_ecf) if _ecf is not None and np.isfinite(float(_ecf)) else ("∞" if _ecf is not None and np.isposinf(float(_ecf)) else "n/a"),
-                    help=expected_cost_help,
-                )
-                t0, t1 = st.columns(2)
-                t0.metric(
-                    "TIME TO BREAKEVEN (FUNDED START, DAYS)",
-                    _fmt_days(_breakeven_days_from_funded),
-                    help=_breakeven_help_funded,
-                )
-                t1.metric(
-                    "TIME TO BREAKEVEN (CHALLENGE START, DAYS)",
-                    _fmt_days(_breakeven_days_from_challenge),
-                    help=_breakeven_help_challenge,
-                )
-
-                _ecs = costs.get("expected_challenge_spend", float("nan"))
-                _act = costs.get("activation_fee", float("nan"))
-                _b95 = float(costs.get("confidence_budget_95", float("nan")))
-                b95_txt = _fmt_dollars(_b95) if np.isfinite(_b95) else "inf"
-                if np.isfinite(float(_ecs)) and _act is not None and np.isfinite(float(_act)):
-                    st.caption(
-                        f"**Breakdown:** challenge spend (E[attempts] × fee) **{_fmt_dollars(float(_ecs))}** + activation **{_fmt_dollars(float(_act))}** "
-                        f"· *95% confidence budget (reference):* **{b95_txt}**"
+                if _run_tpl == TEMPLATE_FOREX:
+                    fx0, fx1, fx2 = st.columns(3)
+                    fx0.metric(
+                        "PAYOUT SUCCESS (CONDITIONAL)",
+                        _fmt_percent(_p_cond_f),
+                        help="Among challenge passes, share that reach ≥1 funded payout.",
+                    )
+                    fx1.metric(
+                        "NET EV ($)",
+                        _fmt_dollars(_net_ev) if np.isfinite(_net_ev) else "n/a",
+                        help=ev_help,
+                    )
+                    fx2.metric(
+                        "AVG TOTAL PAYOUT ($)",
+                        _fmt_dollars(_avg_pay) if np.isfinite(_avg_pay) else "n/a",
+                        help="User withdrawals in funded phase ÷ challenge passes (after split rules).",
+                    )
+                    fxa0, fxa1 = st.columns(2)
+                    fxa0.metric(
+                        "BREAKEVEN ATTEMPT COST (FUNDED START, DAYS)",
+                        _fmt_days(_breakeven_attempts_funded),
+                        help=_breakeven_attempt_help_funded,
+                    )
+                    fxa1.metric(
+                        "BREAKEVEN ATTEMPT COST (CHALLENGE START, DAYS)",
+                        _fmt_days(_breakeven_attempts_challenge),
+                        help=_breakeven_attempt_help_challenge,
                     )
                 else:
-                    st.caption(f"*95% confidence budget (reference):* **{b95_txt}** — {budget_help}")
+                    f0, f1, f2 = st.columns(3)
+                    f0.metric(
+                        "PAYOUT SUCCESS (CONDITIONAL)",
+                        _fmt_percent(_p_cond_f),
+                        help="Among challenge passes, share that reach ≥1 funded payout.",
+                    )
+                    f1.metric(
+                        "FUNDED BLOWUP BEFORE PAYOUT",
+                        _fmt_percent(_blow_cond) if np.isfinite(_blow_cond) else "n/a",
+                        help=(
+                            "Among challenge passes, probability of failing the funded account "
+                            "before receiving the first payout. Sensitive to funded risk per trade."
+                        ),
+                    )
+                    f2.metric(
+                        "PAYOUT SUCCESS (ABSOLUTE)",
+                        _fmt_percent(_p_abs_f),
+                        help="(Simulations with ≥1 funded payout) ÷ all simulations.",
+                    )
+                    g0, g1, g2 = st.columns(3)
+                    g0.metric(
+                        "AVG TOTAL PAYOUT ($)",
+                        _fmt_dollars(_avg_pay) if np.isfinite(_avg_pay) else "n/a",
+                        help="User withdrawals in funded phase ÷ challenge passes (after split rules).",
+                    )
+                    g1.metric(
+                        "NET EV ($)",
+                        _fmt_dollars(_net_ev) if np.isfinite(_net_ev) else "n/a",
+                        help=ev_help,
+                    )
+                    g2.metric(
+                        "EXPECTED COST TO FUNDED ($)",
+                        _fmt_dollars(_ecf) if _ecf is not None and np.isfinite(float(_ecf)) else ("∞" if _ecf is not None and np.isposinf(float(_ecf)) else "n/a"),
+                        help=expected_cost_help,
+                    )
+                    t0, t1 = st.columns(2)
+                    t0.metric(
+                        "TIME TO BREAKEVEN (FUNDED START, DAYS)",
+                        _fmt_days(_breakeven_days_from_funded),
+                        help=_breakeven_help_funded,
+                    )
+                    t1.metric(
+                        "TIME TO BREAKEVEN (CHALLENGE START, DAYS)",
+                        _fmt_days(_breakeven_days_from_challenge),
+                        help=_breakeven_help_challenge,
+                    )
+                    ta0, ta1 = st.columns(2)
+                    ta0.metric(
+                        "BREAKEVEN ATTEMPT COST (FUNDED START, DAYS)",
+                        _fmt_days(_breakeven_attempts_funded),
+                        help=_breakeven_attempt_help_funded,
+                    )
+                    ta1.metric(
+                        "BREAKEVEN ATTEMPT COST (CHALLENGE START, DAYS)",
+                        _fmt_days(_breakeven_attempts_challenge),
+                        help=_breakeven_attempt_help_challenge,
+                    )
+
+                    _ecs = costs.get("expected_challenge_spend", float("nan"))
+                    _act = costs.get("activation_fee", float("nan"))
+                    _b95 = float(costs.get("confidence_budget_95", float("nan")))
+                    b95_txt = _fmt_dollars(_b95) if np.isfinite(_b95) else "inf"
+                    if np.isfinite(float(_ecs)) and _act is not None and np.isfinite(float(_act)):
+                        st.caption(
+                            f"**Breakdown:** challenge spend (E[attempts] × fee) **{_fmt_dollars(float(_ecs))}** + activation **{_fmt_dollars(float(_act))}** "
+                            f"· *95% confidence budget (reference):* **{b95_txt}**"
+                        )
+                    else:
+                        st.caption(f"*95% confidence budget (reference):* **{b95_txt}** — {budget_help}")
 
                 ph = fr.get("payout_histogram_values")
                 if ph is not None and len(ph) > 0:

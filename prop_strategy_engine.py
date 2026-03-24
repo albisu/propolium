@@ -407,6 +407,9 @@ def run_prop_strategy_monte_carlo(
     resample_mode: ResampleMode = "step_iid",
     block_size: int = 10,
     bootstrap_outer_replicates: int = 0,
+    profit_target_phase1_dollar: Optional[float] = None,
+    profit_target_phase2_dollar: Optional[float] = None,
+    apply_challenge_consistency_gate: bool = True,
 ) -> Dict[str, object]:
     """
     Vectorized Monte Carlo:
@@ -438,6 +441,14 @@ def run_prop_strategy_monte_carlo(
         raise ValueError("Funded risk per trade must be >= 0 when set.")
     if profit_target_dollar < 0 or max_loss_dollar < 0 or daily_loss_dollar < 0:
         raise ValueError("Target, Max Loss, and Daily Loss must be >= 0.")
+    use_two_phase = (
+        profit_target_phase1_dollar is not None
+        and profit_target_phase2_dollar is not None
+        and profit_target_phase1_dollar >= 0
+        and profit_target_phase2_dollar >= 0
+    )
+    if use_two_phase and (profit_target_phase1_dollar <= 0 or profit_target_phase2_dollar <= 0):
+        raise ValueError("Phase 1 and Phase 2 profit targets must be > 0 when using two-phase challenge.")
     if drawdown_type not in {"Static", "Trailing"}:
         raise ValueError("drawdown_type must be 'Static' or 'Trailing'.")
     if challenge_fee < 0:
@@ -467,13 +478,24 @@ def run_prop_strategy_monte_carlo(
     if max_steps_cap_check < 1:
         raise ValueError("Not enough data to simulate.")
 
-    target_profit_dollars = float(profit_target_dollar)
     max_loss_dollars = float(max_loss_dollar)
     daily_loss_dollars_static = float(daily_loss_dollar)
-    target_balance = starting_balance + target_profit_dollars
     max_total_loss_balance_static = starting_balance - max_loss_dollars
     risk_dollars_fixed = float(risk_per_trade_dollar)
-    consistency_day_cap = (consistency_rule_pct / 100.0) * target_profit_dollars
+
+    if use_two_phase:
+        target_profit_p1 = float(profit_target_phase1_dollar)
+        target_profit_p2 = float(profit_target_phase2_dollar)
+        target_balance_phase1 = starting_balance + target_profit_p1
+        target_balance_phase2 = starting_balance + target_profit_p2
+        consistency_cap_p1 = (consistency_rule_pct / 100.0) * target_profit_p1
+        consistency_cap_p2 = (consistency_rule_pct / 100.0) * target_profit_p2
+        target_profit_dollars = target_profit_p1 + target_profit_p2  # for output target_balance display
+        target_balance = target_balance_phase2  # final pass threshold
+    else:
+        target_profit_dollars = float(profit_target_dollar)
+        target_balance = starting_balance + target_profit_dollars
+        consistency_day_cap = (consistency_rule_pct / 100.0) * target_profit_dollars
 
     def _sim_realization(
         rng_local: np.random.Generator, r_ratio_arr: np.ndarray, day_codes: np.ndarray
@@ -493,6 +515,7 @@ def run_prop_strategy_monte_carlo(
         daily_pnl = np.zeros(n_sims, dtype=float)
         trades_taken = np.zeros(n_sims, dtype=np.int32)
         challenge_pnl_dollars = np.full(n_sims, np.nan, dtype=float)
+        in_phase2 = np.zeros(n_sims, dtype=bool) if use_two_phase else None
 
         n_paths = int(min(max(1, equity_paths), n_sims))
         plot_idx = rng_local.choice(n_sims, size=n_paths, replace=False)
@@ -525,10 +548,35 @@ def run_prop_strategy_monte_carlo(
             trades_taken[active] += 1
             np.maximum(high_water, equity, out=high_water)
 
-            success_mask = active & (equity >= target_balance)
-            if np.any(success_mask):
-                challenge_pnl_dollars[success_mask] = equity[success_mask] - float(starting_balance)
-                outcome[success_mask] = 1
+            if use_two_phase:
+                phase1_mask = active & (~in_phase2)
+                phase2_mask = active & in_phase2
+
+                success_phase1 = phase1_mask & (equity >= target_balance_phase1)
+                if np.any(success_phase1):
+                    in_phase2[success_phase1] = True
+                    equity[success_phase1] = float(starting_balance)
+                    high_water[success_phase1] = float(starting_balance)
+                    daily_pnl[success_phase1] = 0.0
+                    current_day[success_phase1] = -1
+                    day_start_equity[success_phase1] = float(starting_balance)
+
+                success_phase2 = phase2_mask & (equity >= target_balance_phase2)
+                if np.any(success_phase2):
+                    challenge_pnl_dollars[success_phase2] = equity[success_phase2] - float(starting_balance)
+                    outcome[success_phase2] = 1
+
+                success_mask = success_phase2
+                fail_consistency_mask = (
+                    (phase1_mask & (daily_pnl > consistency_cap_p1))
+                    | (phase2_mask & (daily_pnl > consistency_cap_p2))
+                )
+            else:
+                success_mask = active & (equity >= target_balance)
+                if np.any(success_mask):
+                    challenge_pnl_dollars[success_mask] = equity[success_mask] - float(starting_balance)
+                    outcome[success_mask] = 1
+                fail_consistency_mask = active & (daily_pnl > consistency_day_cap)
 
             fail_daily_mask = active & (daily_pnl <= -daily_loss_dollars_static)
 
@@ -538,8 +586,10 @@ def run_prop_strategy_monte_carlo(
                 max_floor = high_water - max_loss_dollars
 
             fail_max_mask = active & (equity <= max_floor)
-            fail_consistency_mask = active & (daily_pnl > consistency_day_cap)
-            fail_mask = (fail_daily_mask | fail_max_mask | fail_consistency_mask) & (~success_mask)
+            if apply_challenge_consistency_gate:
+                fail_mask = (fail_daily_mask | fail_max_mask | fail_consistency_mask) & (~success_mask)
+            else:
+                fail_mask = (fail_daily_mask | fail_max_mask) & (~success_mask)
             if np.any(fail_mask):
                 outcome[fail_mask] = 0
 
